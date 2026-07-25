@@ -1,0 +1,87 @@
+# Patch overlay CI — v6.5 (manifest-only · 双层形态 · CI 双跑)
+#
+#   1. lint (manifest series[] + extras[], 双层 v6.5 schema)
+#   2. apply --check 双跑 (拉上游 pin commit + apply --check)
+#        路 A: series 在 fresh upstream 上 dry-run
+#        路 B: extras 在 fresh upstream 上 dry-run (路 A 失败时跳过)
+#   3. status 报表 (双层: series counts + extras counts)
+#   4. CI summary post (用 _patches.py summary)
+#
+# master 分支形态: 不读 patch 头, 不校验 DEP-3,
+#   业务不希望 patch 文件被改, 治理信息全在 manifest。
+#   切到 v6.0-patchheader-status 分支恢复 patch 头校验。
+#
+# 业界依据:
+#   - Buildroot:  apply-patches.sh (本仓范式参考) 是独立 stage, CI 不强制 build 全跑
+#   - Yocto:      do_patch 是 do_compile 的硬前置;  patchreview.py 静态校验
+#   - OpenWrt:    patches/series 字典序 apply, buildbot 抽样 compile
+#   本 CI = (Buildroot 静态 + Yocto patchreview) + OpenWrt patch replay + 双跑 dry-run
+#
+# 本地 (Linux 服务器 / CI runner 跑法):
+#   bash tools/apply_patch.sh verify   # CI 默认全跑: lint + 双跑 dry-run + status
+#   bash tools/apply_patch.sh apply    # 顺序 apply 全 patch 到 /tmp/rabitq-build
+
+name: ci
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # +5 min 给双跑 dry-run (拉上游 shallow clone + 路 A + 路 B)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pyyaml + patch
+        run: pip install pyyaml --quiet
+      # patch (POSIX) 用于 diff -uNr 格式 dry-run
+
+      # 缓存 upstream clone (拉 shallow 的 540242e 那个 commit, 重跑可复用)
+      - name: Cache upstream clones
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rabitq-build/upstream
+          key: upstream-${{ hashFiles('src/*/manifest.yaml') }}
+          restore-keys: |
+            upstream-
+
+      - name: Verify (lint + 双跑 dry-run + status)
+        run: bash tools/apply_patch.sh verify
+        env:
+          APPLY: "1"
+
+      # CI 报表 (Step 4 per-layer summary)
+      - name: Post CI summary
+        if: always()
+        run: |
+          echo "## Patch Governance 双层状态" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 层 | 数量 | 启用 | 状态 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----|------|------|------|" >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/_patches.py summary src/*/manifest.yaml >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload build dir on failure (调试用)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rabitq-build-failure-${{ github.run_id }}
+          path: /tmp/rabitq-build/
+          if-no-files-found: ignore
